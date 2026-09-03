@@ -93,7 +93,12 @@ def validate_location(
     if not area or not area.is_active:
         raise BadRequestError("INVALID_AREA", "Area not found or inactive.")
 
-    # TODO (TASK-03): The area must belong to the selected governorate.
+    #  التحقق من أن المنطقة تنتمي إلى المحافظة المختارة
+    if area.governorate_id != governorate_id:
+        raise BadRequestError(
+            "AREA_GOVERNORATE_MISMATCH",
+            "Area does not belong to the selected governorate."
+        )
 
     category = db.get(ServiceCategory, category_id)
     if not category or not category.is_active:
@@ -134,14 +139,19 @@ def create_report(db: Session, citizen: User, data: ReportCreate) -> Report:
     return report
 
 
-def get_citizen_report(db: Session, citizen: User, report_id: int) -> Report:
+def get_citizen_report_or_404(db: Session, report_id: int, citizen_id: int):
     """
-    Return a report.
-    TODO (TASK-02): Ensure citizens can only view their own reports!
+    Retrieve a report only if it exists and belongs to the given citizen.
+    Raises 404 Not Found otherwise (to avoid leaking existence of other reports).
     """
-    report = db.get(Report, report_id)
-    if report is None:
-        raise NotFoundError("Report")
+    from fastapi import HTTPException, status
+    
+    report = db.query(Report).filter(Report.id == report_id).first()
+    if not report or report.citizen_id != citizen_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="Report not found"
+        )
     return report
 
 
