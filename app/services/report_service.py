@@ -289,29 +289,48 @@ def admin_assign_report(
 ) -> Report:
     """
     Admin assigns an employee to a report.
-    Validates that the employee is active and in the same governorate.
+    Validates that the employee is active, an employee, and in the same governorate.
     """
+    # 1. التحقق من وجود البلاغ
     report = db.get(Report, report_id)
     if report is None:
         raise NotFoundError("Report")
 
+    # 2. التحقق من وجود الموظف
     employee = db.get(User, data.employee_id)
     if employee is None:
         raise NotFoundError("Employee")
 
+    # 3. التحقق من أن المستخدم هو موظف فعلاً
     if employee.role != UserRole.employee:
         raise BadRequestError("NOT_EMPLOYEE", "The selected user is not an employee.")
 
+    # 4. التحقق من أن الموظف نشط
     if not employee.is_active:
         raise BadRequestError("INACTIVE_EMPLOYEE", "The selected employee is inactive.")
 
-    # TODO (TASK-04): Ensure employee belongs to the same governorate.
-    
+    #  التحقق من أن الموظف يتبع نفس محافظة البلاغ
+    if employee.governorate_id != report.governorate_id:
+        raise BadRequestError(
+            "EMPLOYEE_GOVERNORATE_MISMATCH",
+            "Employee does not belong to the same governorate as the report."
+        )
+
+    # 5. تحديث بيانات البلاغ (التعيين وتغيير الحالة)
     report.assigned_employee_id = employee.id
     report.status = ReportStatus.assigned
-    
-    # TODO (TASK-04): Record this status change in history.
-    
+
+    #   تسجيل التغيير في سجل التاريخ (Status History)
+    # نستخدم الدالة المساعدة record_status_change الموجودة في أعلى الملف
+    record_status_change(
+        db,
+        report=report,
+        new_status=ReportStatus.assigned,
+        changed_by=admin,
+        note=data.note if data.note else f"Assigned to {employee.full_name}",
+    )
+
+    # 6. حفظ جميع التغييرات في قاعدة البيانات (دفعة واحدة)
     db.commit()
     db.refresh(report)
     return report
