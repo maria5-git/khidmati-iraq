@@ -35,14 +35,27 @@ from app.schemas.report import (
 # ---------------------------------------------------------------------------
 
 # Allowed transitions for employees
-# TODO (TASK-05): Define valid transitions
-EMPLOYEE_TRANSITIONS: dict[ReportStatus, list[ReportStatus]] = {}
-
+# جدول الانتقالات الصحيح (جميع الأدوار)
+TRANSITIONS: dict[ReportStatus, list[ReportStatus]] = {
+    ReportStatus.submitted: [ReportStatus.under_review, ReportStatus.rejected, ReportStatus.cancelled],
+    ReportStatus.under_review: [ReportStatus.assigned, ReportStatus.rejected],
+    ReportStatus.assigned: [ReportStatus.in_progress, ReportStatus.under_review],
+    ReportStatus.in_progress: [ReportStatus.resolved, ReportStatus.assigned],
+    # الحالات النهائية لا يمكن الانتقال منها لأي حالة أخرى
+    ReportStatus.resolved: [],
+    ReportStatus.rejected: [],
+    ReportStatus.cancelled: [],
+}
 def validate_transition(from_status: ReportStatus, to_status: ReportStatus) -> None:
     """
-    TODO (TASK-05): Raise InvalidStatusTransitionError if the transition is not allowed.
+    التحقق من أن الانتقال من حالة لأخرى مسموح به وفق جدول TRANSITIONS.
+    إذا كان غير مسموح، يتم رفع خطأ InvalidStatusTransitionError.
     """
-    pass
+    allowed = TRANSITIONS.get(from_status, [])
+    if to_status not in allowed:
+        raise InvalidStatusTransitionError(
+            f"Transition from {from_status.value} to {to_status.value} is not allowed."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -131,9 +144,14 @@ def create_report(db: Session, citizen: User, data: ReportCreate) -> Report:
         priority=ReportPriority.medium,
     )
     db.add(report)
-    db.flush()  # Get report.id before recording history.
-
-    # TODO (TASK-05): Record the initial status entry in history.
+    db.flush()      # تسجيل الحالة الأولية في سجل التاريخ
+    record_status_change(
+        db,
+        report=report,
+        new_status=ReportStatus.submitted,
+        changed_by=citizen,
+        note="Citizen submitted the report.",
+    )
     db.commit()
     db.refresh(report)
     return report
@@ -160,7 +178,7 @@ def update_citizen_report(db: Session, citizen: User, report_id: int, data: Repo
     Citizens can update a report only while it is in 'submitted' status.
     They cannot change status, priority, or assigned employee.
     """
-    report = get_citizen_report(db, citizen, report_id)
+    report = get_citizen_report_or_404(db, report_id, citizen.id)
 
     if report.status != ReportStatus.submitted:
         raise BadRequestError(
@@ -188,17 +206,19 @@ def cancel_report(db: Session, citizen: User, report_id: int) -> Report:
     A citizen can cancel their own report only when it is in a cancellable state.
     Creates a status-history entry.
     """
-    report = get_citizen_report(db, citizen, report_id)
+    report = get_citizen_report_or_404(db, report_id, citizen.id)
 
-    cancellable_statuses = {ReportStatus.submitted, ReportStatus.under_review}
-    if report.status not in cancellable_statuses:
-        raise BadRequestError(
-            "CANNOT_CANCEL",
-            "You can only cancel a report that is in 'submitted' or 'under_review' status.",
-        )
+    # استخدام دالة التحقق المركزية 
+    validate_transition(report.status, ReportStatus.cancelled)
 
-    report.status = ReportStatus.cancelled
-    # TODO (TASK-05): Record this change in status history.
+    # تسجيل التغيير في التاريخ
+    record_status_change(
+        db,
+        report=report,
+        new_status=ReportStatus.cancelled,
+        changed_by=citizen,
+        note="Citizen cancelled the report.",
+    )
 
     db.commit()
     db.refresh(report)
@@ -226,10 +246,17 @@ def employee_update_status(
     """Employee changes a report status."""
     report = get_report_for_employee(db, employee, report_id)
     
-    # TODO (TASK-05): Validate transition using allowed transition table.
-    report.status = data.new_status
+    # التحقق من أن الانتقال مسموح به 
+    validate_transition(report.status, data.new_status)
     
-    # TODO (TASK-05): Record status change.
+    # تحديث الحالة وتسجيل التاريخ
+    record_status_change(
+        db,
+        report=report,
+        new_status=data.new_status,
+        changed_by=employee,
+        note=data.note if data.note else f"Status changed to {data.new_status.value}",
+    )
     
     db.commit()
     db.refresh(report)
@@ -316,12 +343,12 @@ def admin_assign_report(
             "Employee does not belong to the same governorate as the report."
         )
 
-    # 5. تحديث بيانات البلاغ (التعيين وتغيير الحالة)
+       # 5. تحديث بيانات البلاغ (التعيين وتغيير الحالة)
     report.assigned_employee_id = employee.id
-    report.status = ReportStatus.assigned
+    # التحقق من أن الانتقال إلى حالة 'assigned' مسموح به 
+    validate_transition(report.status, ReportStatus.assigned)
 
-    #   تسجيل التغيير في سجل التاريخ (Status History)
-    # نستخدم الدالة المساعدة record_status_change الموجودة في أعلى الملف
+    # تحديث الحالة وتسجيل التاريخ (مرة واحدة فقط)
     record_status_change(
         db,
         report=report,

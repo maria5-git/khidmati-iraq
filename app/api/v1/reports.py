@@ -3,10 +3,10 @@ app/api/v1/reports.py
 Citizen-facing report endpoints.
 """
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import require_citizen
+from app.core.dependencies import get_current_user, require_citizen  
 from app.database import get_db
 from app.models.comment import ReportComment
 from app.models.report import Report
@@ -15,8 +15,8 @@ from app.models.user import User, UserRole
 from app.schemas.comment import CommentCreate, CommentResponse
 from app.schemas.report import (
     ReportCreate,
-    ReportDetailResponse,  # استخدمنا هذا لأنه موجود في الملف
-    ReportResponse,        # أضفناه للاستيراد
+    ReportDetailResponse,
+    ReportResponse,
     ReportUpdate,
     StatusHistoryResponse,
 )
@@ -36,7 +36,6 @@ def create_report(
     """Submit a new service-problem report."""
     return report_service.create_report(db, citizen, data)
 
-
 # ----------------------------------------------
 # 2. عرض بلاغاتي (قائمة)
 # ----------------------------------------------
@@ -53,7 +52,6 @@ def my_reports(
         .all()
     )
 
-
 # ----------------------------------------------
 # 3. عرض بلاغ معين (مع التحقق من الملكية)
 # ----------------------------------------------
@@ -61,16 +59,14 @@ def my_reports(
 def get_report(
     id: int,
     db: Session = Depends(get_db),
-    citizen: User = Depends(require_citizen),  # تم التعديل هنا
+    citizen: User = Depends(require_citizen),
 ):
     """
-    Get a specific report. 
+    Get a specific report.
     Only the citizen who owns the report can view it.
     """
-    # استخدم الدالة التي تتحقق من الملكية (سنضيفها في الـ service)
     report = report_service.get_citizen_report_or_404(db, id, citizen.id)
     return report
-
 
 # ----------------------------------------------
 # 4. تحديث بلاغ (مع التحقق من الملكية)
@@ -83,16 +79,12 @@ def update_report(
     citizen: User = Depends(require_citizen),
 ):
     """
-    Update a report. 
+    Update a report.
     Only the owner can update it.
     """
-    # 1. تحقق من أن المواطن يملك البلاغ
-    report = report_service.get_citizen_report_or_404(db, id, citizen.id)
-    
-    # 2. قم بتحديث البلاغ (نمرر citizen.id للتأكد في الـ Service أيضاً)
-    updated_report = report_service.update_report(db, id, report_update, citizen.id)
+    # استخدم الدالة الصحيحة (update_citizen_report) مع ترتيب المعاملات الصحيح
+    updated_report = report_service.update_citizen_report(db, citizen, id, report_update)
     return updated_report
-
 
 # ----------------------------------------------
 # 5. إلغاء بلاغ (مع التحقق من الملكية)
@@ -104,37 +96,52 @@ def cancel_report(
     citizen: User = Depends(require_citizen),
 ):
     """
-    Cancel a report. 
+    Cancel a report.
     Only the owner can cancel it.
     """
-    # 1. تحقق من الملكية
-    report = report_service.get_citizen_report_or_404(db, id, citizen.id)
-    
-    # 2. قم بالإلغاء (نمرر citizen.id للتأكد)
-    cancelled_report = report_service.cancel_report(db, id, citizen.id)
+    cancelled_report = report_service.cancel_report(db, citizen, id)
     return cancelled_report
 
-
 # ----------------------------------------------
-# 6. عرض سجل التحديثات (مع التحقق من الملكية)
+# 6. عرض سجل التحديثات (مع صلاحيات متعددة)
 # ----------------------------------------------
 @router.get("/{report_id}/history", response_model=list[StatusHistoryResponse])
 def get_report_history(
     report_id: int,
     db: Session = Depends(get_db),
-    citizen: User = Depends(require_citizen),
+    current_user: User = Depends(get_current_user), 
 ):
-    """Return the status-change history for the citizen's report."""
-    # تأكد من أن المواطن يملك البلاغ أولاً
-    report_service.get_citizen_report_or_404(db, report_id, citizen.id)
-    
+    """
+    Return the status-change history for the report.
+    Allowed access:
+    - The citizen who owns the report.
+    - An employee belonging to the same governorate.
+    - Any admin.
+    """
+    from app.core.exceptions import NotFoundError, PermissionDeniedError
+
+    report = db.get(Report, report_id)
+    if not report:
+        raise NotFoundError("Report")
+
+    is_owner = (report.citizen_id == current_user.id)
+    is_employee_in_governorate = (
+        current_user.role == UserRole.employee and
+        report.governorate_id == current_user.governorate_id
+    )
+    is_admin = (current_user.role == UserRole.admin)
+
+    if not (is_owner or is_employee_in_governorate or is_admin):
+        raise PermissionDeniedError(
+            "You do not have permission to view this report's history."
+        )
+
     return (
         db.query(ReportStatusHistory)
         .filter(ReportStatusHistory.report_id == report_id)
         .order_by(ReportStatusHistory.created_at.asc())
         .all()
     )
-
 
 # ----------------------------------------------
 # 7. عرض التعليقات العامة (مع التحقق من الملكية)
@@ -146,10 +153,8 @@ def get_comments(
     citizen: User = Depends(require_citizen),
 ):
     """Get public comments for the citizen's own report."""
-    # تأكد من الملكية
     report_service.get_citizen_report_or_404(db, id, citizen.id)
-    
-    # جلب التعليقات العامة فقط (is_internal=False)
+
     comments = (
         db.query(ReportComment)
         .filter(ReportComment.report_id == id, ReportComment.is_internal == False)
@@ -157,7 +162,6 @@ def get_comments(
         .all()
     )
     return comments
-
 
 # ----------------------------------------------
 # 8. إضافة تعليق عام (مع التحقق من الملكية)
@@ -170,8 +174,5 @@ def add_comment(
     citizen: User = Depends(require_citizen),
 ):
     """Add a public comment to the citizen's own report."""
-    # تأكد من الملكية قبل التعليق
     report_service.get_citizen_report_or_404(db, report_id, citizen.id)
-    
-    # أضف التعليق (is_internal=False لأن مواطن لا يكتب داخلياً)
     return report_service.add_comment(db, citizen, report_id, data.content, is_internal=False)
