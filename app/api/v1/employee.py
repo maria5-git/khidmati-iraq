@@ -6,11 +6,12 @@ Employee-facing endpoints for managing reports within their governorate.
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
-from app.core.dependencies import require_employee
-from app.database import get_db
+from app.core.dependencies import require_employee, require_employee_or_admin  
+from app.core.exceptions import PermissionDeniedError
+from app.database import get_db  
 from app.models.comment import ReportComment
 from app.models.report import Report
-from app.models.user import User
+from app.models.user import User, UserRole  
 from app.schemas.comment import CommentCreate, CommentResponse
 from app.schemas.report import (
     ReportDetailResponse,
@@ -37,18 +38,29 @@ def list_governorate_reports(
     )
 
 
-@router.get("/reports/assigned", response_model=list[ReportResponse])
-def list_assigned_reports(
+@router.get("/reports/{report_id}/comments")
+def get_employee_comments(
+    report_id: int,
     db: Session = Depends(get_db),
-    employee: User = Depends(require_employee),
+    current_user: User = Depends(require_employee_or_admin),
 ):
-    """List reports assigned to the current employee."""
-    return (
-        db.query(Report)
-        .filter(Report.assigned_employee_id == employee.id)
-        .order_by(Report.created_at.desc())
+    """
+    Get all comments (public + internal) for a report.
+    Employee must belong to the same governorate.
+    Admin can view any report's comments.
+    """
+    if current_user.role == UserRole.employee:
+        report = db.get(Report, report_id)
+        if not report or report.governorate_id != current_user.governorate_id:
+            raise PermissionDeniedError("You can only view comments for reports in your governorate.")
+
+    comments = (
+        db.query(ReportComment)
+        .filter(ReportComment.report_id == report_id)
+        .order_by(ReportComment.created_at.asc())
         .all()
     )
+    return comments
 
 
 @router.patch("/reports/{report_id}/status", response_model=ReportResponse)
@@ -79,11 +91,25 @@ def add_internal_note(
     report_id: int,
     data: CommentCreate,
     db: Session = Depends(get_db),
-    employee: User = Depends(require_employee),
+    current_user: User = Depends(require_employee_or_admin),
 ):
-    """Add an internal note (not visible to citizens)."""
-    report_service.get_report_for_employee(db, employee, report_id)
-    return report_service.add_comment(db, employee, report_id, data.content, is_internal=True)
+    """
+    Add an internal note (is_internal=True) to a report.
+    Employee must belong to the same governorate.
+    Admin can add internal notes to any report.
+    """
+    if current_user.role == UserRole.employee:
+        report = db.get(Report, report_id)
+        if not report or report.governorate_id != current_user.governorate_id:
+            raise PermissionDeniedError("You can only add notes to reports in your governorate.")
+
+    return report_service.add_comment(
+        db=db,
+        author=current_user,
+        report_id=report_id,
+        content=data.content,
+        is_internal=True,
+    )
 
 
 @router.post("/reports/{report_id}/resolve", response_model=ReportResponse)
