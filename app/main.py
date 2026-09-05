@@ -47,7 +47,7 @@ app.include_router(api_router)
 # ---------------------------------------------------------------------------
 # Global exception handler – hide internal details from clients
 # ---------------------------------------------------------------------------
-
+"""
 @app.exception_handler(Exception)
 async def unhandled_exception_handler(request: Request, exc: Exception):
     # Let FastAPI's default HTTPException handler deal with known errors.
@@ -59,7 +59,7 @@ async def unhandled_exception_handler(request: Request, exc: Exception):
         status_code=500,
         content={"error": {"code": "INTERNAL_ERROR", "message": "An unexpected error occurred."}},
     )
-
+"""
 
 # ---------------------------------------------------------------------------
 # Health check

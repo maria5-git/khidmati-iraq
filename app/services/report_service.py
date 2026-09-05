@@ -75,8 +75,8 @@ def record_status_change(
     """
     history = ReportStatusHistory(
         report_id=report.id,
-        previous_status=report.status.value if report.status else None,
-        new_status=new_status.value,
+        previous_status=report.status.value if report.status else None,  
+        new_status=new_status.value,  
         changed_by_id=changed_by.id,
         note=note,
     )
@@ -268,16 +268,39 @@ def employee_resolve_report(
 ) -> Report:
     """
     Resolve a report.
-    TODO (TASK-07): Enforce resolution rules and tracking.
+    TASK-07: Enforce mandatory resolution summary and proper history tracking.
     """
+    # 1. التأكد من أن الموظف لديه صلاحية على هذا البلاغ (نفس المحافظة)
     report = get_report_for_employee(db, employee, report_id)
 
-    report.resolution_summary = data.resolution_summary
+    # 2. التحقق من أن ملخص الحل مطلوب وغير فارغ
+    if not data.resolution_summary or not data.resolution_summary.strip():
+        raise BadRequestError(
+            "RESOLUTION_REQUIRED",
+            "Resolution summary is required and cannot be empty or whitespace only."
+        )
+
+    # 3. التحقق من أن انتقال الحالة إلى 'resolved' مسموح به
+    #    استخدم try/except لتحويل InvalidStatusTransitionError إلى BadRequestError
+    try:
+        validate_transition(report.status, ReportStatus.resolved)
+    except InvalidStatusTransitionError as e:
+        raise BadRequestError("INVALID_TRANSITION", str(e))
+
+    # 4. تحديث بيانات البلاغ
+    report.resolution_summary = data.resolution_summary.strip()
     report.resolved_at = datetime.now(timezone.utc)
-    report.status = ReportStatus.resolved
-    
-    # TODO (TASK-07): Record status change in history.
-    
+
+    # 5. تسجيل التغيير في سجل التاريخ
+    record_status_change(
+        db,
+        report=report,
+        new_status=ReportStatus.resolved,
+        changed_by=employee,
+        note=f"Report resolved. Summary: {data.resolution_summary[:50]}..."
+    )
+
+    # 6. حفظ جميع التغييرات في قاعدة البيانات (دفعة واحدة)
     db.commit()
     db.refresh(report)
     return report
