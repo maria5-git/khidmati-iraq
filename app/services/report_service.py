@@ -28,6 +28,7 @@ from app.schemas.report import (
     ReportUpdate,
     ResolveRequest,
     StatusUpdateRequest,
+    ReportFilterParams,
 )
 
 # ---------------------------------------------------------------------------
@@ -37,7 +38,7 @@ from app.schemas.report import (
 # Allowed transitions for employees
 # جدول الانتقالات الصحيح (جميع الأدوار)
 TRANSITIONS: dict[ReportStatus, list[ReportStatus]] = {
-    ReportStatus.submitted: [ReportStatus.under_review, ReportStatus.rejected, ReportStatus.cancelled],
+    ReportStatus.submitted: [ReportStatus.under_review, ReportStatus.rejected, ReportStatus.cancelled, ReportStatus.assigned,],
     ReportStatus.under_review: [ReportStatus.assigned, ReportStatus.rejected],
     ReportStatus.assigned: [ReportStatus.in_progress, ReportStatus.under_review],
     ReportStatus.in_progress: [ReportStatus.resolved, ReportStatus.assigned],
@@ -47,15 +48,10 @@ TRANSITIONS: dict[ReportStatus, list[ReportStatus]] = {
     ReportStatus.cancelled: [],
 }
 def validate_transition(from_status: ReportStatus, to_status: ReportStatus) -> None:
-    """
-    التحقق من أن الانتقال من حالة لأخرى مسموح به وفق جدول TRANSITIONS.
-    إذا كان غير مسموح، يتم رفع خطأ InvalidStatusTransitionError.
-    """
     allowed = TRANSITIONS.get(from_status, [])
     if to_status not in allowed:
-        raise InvalidStatusTransitionError(
-            f"Transition from {from_status.value} to {to_status.value} is not allowed."
-        )
+        #  تمرير الوسيطين المطلوبين بشكل منفصل
+        raise InvalidStatusTransitionError(from_status.value, to_status.value)
 
 
 # ---------------------------------------------------------------------------
@@ -281,11 +277,9 @@ def employee_resolve_report(
         )
 
     # 3. التحقق من أن انتقال الحالة إلى 'resolved' مسموح به
-    #    استخدم try/except لتحويل InvalidStatusTransitionError إلى BadRequestError
-    try:
-        validate_transition(report.status, ReportStatus.resolved)
-    except InvalidStatusTransitionError as e:
-        raise BadRequestError("INVALID_TRANSITION", str(e))
+    #    هذه الدالة سترفع InvalidStatusTransitionError إذا كان الانتقال غير مسموح،
+    #    وسيتعامل معها FastAPI مباشرة (بدون تغليف منا)
+    validate_transition(report.status, ReportStatus.resolved)
 
     # 4. تحديث بيانات البلاغ
     report.resolution_summary = data.resolution_summary.strip()
@@ -398,3 +392,140 @@ def admin_update_priority(
     db.commit()
     db.refresh(report)
     return report
+
+
+# ---------------------------------------------------------------------------
+# Admin Dashboard
+# ---------------------------------------------------------------------------
+
+def get_dashboard_stats(db: Session) -> dict:
+    """
+    TASK-08: Return aggregated statistics for the admin dashboard.
+    """
+    from sqlalchemy import func
+
+    # 1. إجمالي البلاغات
+    total_reports = db.query(func.count(Report.id)).scalar() or 0
+
+    # 2. البلاغات المفتوحة (ليست منتهية)
+    open_statuses = [ReportStatus.submitted, ReportStatus.under_review, 
+                     ReportStatus.assigned, ReportStatus.in_progress]
+    open_reports = (
+        db.query(func.count(Report.id))
+        .filter(Report.status.in_(open_statuses))
+        .scalar() or 0
+    )
+
+    # 3. البلاغات المغلقة (محلولة)
+    resolved_reports = (
+        db.query(func.count(Report.id))
+        .filter(Report.status == ReportStatus.resolved)
+        .scalar() or 0
+    )
+
+    # 4. التوزيع حسب الحالة
+    status_breakdown = {}
+    for status in ReportStatus:
+        count = (
+            db.query(func.count(Report.id))
+            .filter(Report.status == status)
+            .scalar() or 0
+        )
+        if count > 0:
+            status_breakdown[status.value] = count
+
+    # 5. التوزيع حسب الأولوية
+    priority_breakdown = {}
+    for priority in ReportPriority:
+        count = (
+            db.query(func.count(Report.id))
+            .filter(Report.priority == priority)
+            .scalar() or 0
+        )
+        if count > 0:
+            priority_breakdown[priority.value] = count
+
+    # 6. التوزيع حسب التصنيف (مع جلب اسم التصنيف)
+    from app.models.category import ServiceCategory
+    category_breakdown = []
+    categories = db.query(ServiceCategory).all()
+    for cat in categories:
+        count = (
+            db.query(func.count(Report.id))
+            .filter(Report.category_id == cat.id)
+            .scalar() or 0
+        )
+        if count > 0:
+           category_breakdown.append({
+            "category_id": cat.id,
+            "category_name": cat.name_ar,  #  استخدم name_ar بدلاً من name
+            "count": count
+            })
+
+    return {
+        "total_reports": total_reports,
+        "open_reports": open_reports,
+        "resolved_reports": resolved_reports,
+        "by_status": status_breakdown,
+        "by_priority": priority_breakdown,
+        "by_category": category_breakdown,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Admin report filtering & pagination
+# ---------------------------------------------------------------------------
+
+def get_filtered_reports(db: Session, filters: ReportFilterParams) -> dict:
+    """
+    TASK-01: Apply filters, search, and pagination to the admin report list.
+    """
+    from sqlalchemy import or_
+    
+    query = db.query(Report)
+
+    # 1. تطبيق الفلاتر (إذا كانت موجودة)
+    if filters.status:
+        query = query.filter(Report.status == filters.status)
+    if filters.priority:
+        query = query.filter(Report.priority == filters.priority)
+    if filters.category_id:
+        query = query.filter(Report.category_id == filters.category_id)
+    if filters.governorate_id:
+        query = query.filter(Report.governorate_id == filters.governorate_id)
+    if filters.assigned_employee_id:
+        query = query.filter(Report.assigned_employee_id == filters.assigned_employee_id)
+
+    # 2. تطبيق البحث (case-insensitive) في reference_number, title, description
+    if filters.search:
+        search_term = f"%{filters.search}%"
+        query = query.filter(
+            or_(
+                Report.reference_number.ilike(search_term),
+                Report.title.ilike(search_term),
+                Report.description.ilike(search_term),
+            )
+        )
+
+    # 3. حساب العدد الإجمالي قبل تطبيق pagination
+    total = query.count()
+
+    # 4. تطبيق pagination
+    items = (
+        query
+        .order_by(Report.created_at.desc())
+        .offset((filters.page - 1) * filters.page_size)
+        .limit(filters.page_size)
+        .all()
+    )
+
+    # 5. حساب عدد الصفحات الإجمالي
+    total_pages = (total + filters.page_size - 1) // filters.page_size
+
+    return {
+        "page": filters.page,
+        "page_size": filters.page_size,
+        "total": total,
+        "total_pages": total_pages,
+        "items": items,
+    }
